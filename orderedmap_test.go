@@ -2,6 +2,7 @@ package orderedmap
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -210,7 +211,7 @@ func TestMarshalJSONNoEscapeHTML(t *testing.T) {
 	if err != nil {
 		t.Error("Marshalling json", err)
 	}
-	s := strings.Replace(string(b), "\n", "", -1)
+	s := string(b)
 	// check json is correctly ordered
 	if s != `{"specialstring":"\\.<>[]{}_-"}` {
 		t.Error("JSON Marshal value is incorrect", s)
@@ -229,7 +230,7 @@ func TestMarshalJSONNoEscapeHTMLRecursive(t *testing.T) {
 	if err != nil {
 		t.Error("Marshalling json", err)
 	}
-	s := strings.Replace(string(b), "\n", "", -1)
+	s := string(b)
 	if s != src {
 		t.Error("JSON Marshal value is incorrect", s)
 	}
@@ -242,7 +243,7 @@ func TestMarshalJSONEscapeHTML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := strings.Replace(string(b), "\n", "", -1)
+	s := string(b)
 	if s != `{"chars":"<>&"}` {
 		t.Errorf("default MarshalJSON HTML-escaped: %s", s)
 	}
@@ -252,9 +253,25 @@ func TestMarshalJSONEscapeHTML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = strings.Replace(string(b), "\n", "", -1)
+	s = string(b)
 	if s != `{"chars":"\u003c\u003e\u0026"}` {
 		t.Errorf("SetEscapeHTML(true) did not escape: %s", s)
+	}
+}
+
+func TestMarshalJSONNoNewlines(t *testing.T) {
+	o := New()
+	o.Set("a", 1)
+	o.Set("b", "x\ny")
+	b, err := o.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "\n") {
+		t.Errorf("MarshalJSON left newlines: %q", b)
+	}
+	if string(b) != `{"a":1,"b":"x\ny"}` {
+		t.Errorf("MarshalJSON = %s", b)
 	}
 }
 
@@ -376,6 +393,50 @@ func TestUnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestUnmarshalJSONNull(t *testing.T) {
+	// json.Unmarshal into a *OrderedMap (not **OrderedMap). Passing &o would
+	// set o to nil without calling UnmarshalJSON.
+	o := New()
+	o.Set("a", 1)
+	if err := json.Unmarshal([]byte("null"), o); err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Keys()) != 0 {
+		t.Fatalf("keys after null: %v", o.Keys())
+	}
+	if vals := o.Values(); len(vals) != 0 {
+		t.Fatalf("values after null: %v", vals)
+	}
+
+	o = New()
+	o.Set("a", 1)
+	if err := json.Unmarshal([]byte(" \nnull\t"), o); err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Keys()) != 0 {
+		t.Fatalf("keys after padded null: %v", o.Keys())
+	}
+
+	// Options are preserved; only the map contents are cleared.
+	o = New()
+	o.SetEscapeHTML(true)
+	o.SetJSONLastValueWins(true)
+	o.Set("a", 1)
+	if err := o.UnmarshalJSON([]byte(" null ")); err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Keys()) != 0 {
+		t.Fatalf("keys after spaced null: %v", o.Keys())
+	}
+	b, err := o.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{}` {
+		t.Fatalf("marshal empty after null: %q", b)
+	}
+}
+
 func TestUnmarshalJSONDuplicateKeys(t *testing.T) {
 	s := `{
 		"a": [{}, []],
@@ -461,6 +522,8 @@ func TestOrderedMapUnmarshalJSONDuplicate(t *testing.T) {
 	err := json.Unmarshal([]byte(s), &o)
 	if err == nil {
 		t.Errorf("orderedMap unmarshal did not error on duplicate key")
+	} else if !errors.Is(err, ErrJSONDuplicate) {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -669,7 +732,7 @@ func TestUnmarshalJSONNestedDuplicate(t *testing.T) {
 		err := json.Unmarshal([]byte(s), &o)
 		if err == nil {
 			t.Errorf("no error on nested duplicate key: %s", s)
-		} else if !strings.HasPrefix(err.Error(), "orderedmap: JSON duplicate field") {
+		} else if !errors.Is(err, ErrJSONDuplicate) {
 			t.Errorf("unexpected error for %s: %v", s, err)
 		}
 
@@ -730,4 +793,32 @@ func ExampleCheckDuplicate() {
 
 	// Output:
 	// [a b c]
+}
+
+func TestErrJSONDuplicate(t *testing.T) {
+	plain := fmt.Errorf("orderedmap: JSON duplicate field %q", "a")
+	if errors.Is(plain, ErrJSONDuplicate) {
+		t.Fatal("plain fmt.Errorf should not match ErrJSONDuplicate")
+	}
+	var de *DuplicateFieldError
+	if errors.As(plain, &de) {
+		t.Fatal("plain fmt.Errorf should not match DuplicateFieldError")
+	}
+
+	_, err := CheckDuplicate(json.NewDecoder(strings.NewReader(`{"a":1,"a":2}`)))
+	if err == nil {
+		t.Fatal("expected duplicate error")
+	}
+	if !errors.Is(err, ErrJSONDuplicate) {
+		t.Fatalf("errors.Is failed: %v", err)
+	}
+	if !errors.As(err, &de) {
+		t.Fatalf("errors.As failed: %v", err)
+	}
+	if de.Field != "a" {
+		t.Fatalf("Field = %q, want a", de.Field)
+	}
+	if err.Error() != `orderedmap: JSON duplicate field "a"` {
+		t.Fatalf("Error() = %q", err.Error())
+	}
 }

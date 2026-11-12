@@ -14,6 +14,7 @@ package orderedmap
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -135,7 +136,20 @@ func (o *OrderedMap) Sort(lessFunc func(a *Pair, b *Pair) bool) {
 
 // UnmarshalJSON errors on duplicate JSON keys unless SetJSONLastValueWins(true)
 // was called. "Last value wins" is bad practice. See CheckDuplicate.
+// A JSON null unmarshals to an empty OrderedMap.
+//
+// encoding/json sets a pointer to nil when unmarshaling JSON null into *T, and
+// does not call UnmarshalJSON. To apply null to an existing OrderedMap, pass
+// the *OrderedMap to json.Unmarshal (not a pointer to it) or call
+// UnmarshalJSON directly.
 func (o *OrderedMap) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		o.keys = []string{}
+		o.values = map[string]any{}
+		return nil
+	}
+
 	var err error
 	if !o.jsonLastValueWins {
 		_, err = CheckDuplicate(json.NewDecoder(bytes.NewReader(b)))
@@ -281,8 +295,9 @@ func decodeSlice(dec *json.Decoder, s []any, escapeHTML bool) error {
 	}
 }
 
-// MarshalJSON writes keys in order. Output has no duplicate keys since
-// OrderedMap keys are unique.
+// MarshalJSON writes keys in order as compact JSON, with no trailing newlines
+// from the encoder. Output has no duplicate keys since OrderedMap keys are
+// unique.
 func (o OrderedMap) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte('{')
@@ -296,23 +311,47 @@ func (o OrderedMap) MarshalJSON() ([]byte, error) {
 		if err := encoder.Encode(k); err != nil {
 			return nil, err
 		}
+		buf.Truncate(buf.Len() - 1) // strip Encode's trailing newline
 		buf.WriteByte(':')
 		// add value
 		if err := encoder.Encode(o.values[k]); err != nil {
 			return nil, err
 		}
+		buf.Truncate(buf.Len() - 1) // strip Encode's trailing newline
 	}
 	buf.WriteByte('}')
 	return buf.Bytes(), nil
 }
 
-// ErrJSONDuplicate allows applications to check for JSON duplicate error.
-type ErrJSONDuplicate error
+// ErrJSONDuplicate is returned when CheckDuplicate or UnmarshalJSON encounters
+// a duplicate JSON object key. Compare with errors.Is. To get the field name,
+// use errors.As with *DuplicateFieldError.
+var ErrJSONDuplicate = errors.New("orderedmap: JSON duplicate field")
+
+// DuplicateFieldError names the duplicate JSON key. It unwraps to
+// ErrJSONDuplicate.
+//
+//	var e *DuplicateFieldError
+//	if errors.As(err, &e) {
+//		_ = e.Field
+//	}
+type DuplicateFieldError struct {
+	Field string
+}
+
+func (e *DuplicateFieldError) Error() string {
+	return fmt.Sprintf("orderedmap: JSON duplicate field %q", e.Field)
+}
+
+func (e *DuplicateFieldError) Unwrap() error {
+	return ErrJSONDuplicate
+}
 
 // CheckDuplicate checks for JSON duplicates on ingest (unmarshal). If there are
 // no duplicates, it returns the top-level unique keys in order. Note that
 // Go maps and structs and Javascript objects (ES6) already require unique
-// JSON names.
+// JSON names. Duplicate keys return a *DuplicateFieldError, which unwraps to
+// ErrJSONDuplicate.
 //
 // Duplicate JSON fields are a security issue that wasn't addressed by the
 // original spec that results in surprising behavior and is a source of bugs.
@@ -320,9 +359,9 @@ type ErrJSONDuplicate error
 // Vulnerabilities](https://bishopfox.com/blog/json-interoperability-vulnerabilities)"
 // and control-f "duplicate".
 //
-// Until Go releases the planned revision to the JSON package (See
-// https://github.com/go-json-experiment/json), or adds support for erroring on
-// duplicates to the current package, this function is needed.
+// encoding/json/v2, stable in Go 1.27, rejects duplicate keys. This helper
+// remains useful with encoding/json v1, which still uses last-value-wins, and
+// because it returns the top-level keys when the input has no duplicates.
 //
 // After JSON was widely adopted, Douglas Crockford (JSON's inventor), tried to
 // fix this by updating JSON to define "must error on duplicates" as the correct
@@ -363,7 +402,7 @@ func CheckDuplicate(d *json.Decoder) (topLevelObjectKeys []string, e error) {
 
 			key := t.(string)
 			if keysBool[key] { // Check for duplicates.
-				return nil, ErrJSONDuplicate(fmt.Errorf("orderedmap: JSON duplicate field %q", key))
+				return nil, &DuplicateFieldError{Field: key}
 			}
 			keysBool[key] = true
 			keys = append(keys, key)
